@@ -16,15 +16,18 @@
 #include <iostream>
 #include <atomic>
 #include <poll.h>
+#include <sys/epoll.h>
 
 // #define SELECT_IMPL
-#define POLL_IMPL
+// #define POLL_IMPL
+#define EPOLL_IMPL
 
 typedef size_t lengthSizeType;
 const size_t bytesForLengthSizeTypes = sizeof(lengthSizeType);
 const size_t oneReadSize = 512;
 const size_t oneWriteSize = 512;
 std::atomic<int> connections_counter{0};
+bool read_flag = false;
 
 struct Request
 {
@@ -91,6 +94,34 @@ void handle_accept_poll(int listeningFd, std::unordered_map<int, std::unique_ptr
     connections_counter.fetch_add(1);
 }
 
+void handle_accept_epoll(int listeningFd, std::unordered_map<int, std::unique_ptr<ConnectionState>> &fdsToConnections, int epollFd)
+{
+    int newSock = accept(listeningFd, NULL, NULL);
+    if (newSock < 0)
+    {
+        return;
+    }
+
+    int flags = fcntl(newSock, F_GETFL, 0);
+    flags |= O_NONBLOCK;
+    fcntl(newSock, F_SETFL, flags);
+
+    epoll_event ev;
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.fd = newSock;
+
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, newSock, &ev) == -1)
+    {
+        perror("epoll_ctl: EPOLL_CTL_ADD");
+        exit(EXIT_FAILURE);
+    }
+
+    fdsToConnections[newSock] = std::make_unique<ConnectionState>(newSock);
+    fdsToConnections[newSock]->want_read = true;
+
+    connections_counter.fetch_add(1);
+}
+
 void transform(const std::vector<uint8_t> &dataIn, std::vector<uint8_t> &dataOut)
 {
     dataOut = dataIn;
@@ -142,6 +173,7 @@ void handle_read(ConnectionState &connection)
         return;
     }
 
+    read_flag = true;
     std::cout << "handle_read got " << bytes_read << " bytes" << std::endl;
 
     connection.incoming_buffer.insert(connection.incoming_buffer.end(), buf, buf + bytes_read);
@@ -211,12 +243,40 @@ int main()
     std::unordered_map<int, std::unique_ptr<ConnectionState>> fdsToConnections; // fd -> ConnectionState ptr
 #endif
 
+#ifdef EPOLL_IMPL
+    impl = "EPOLL";
+    std::unordered_map<int, std::unique_ptr<ConnectionState>> fdsToConnections; // fd -> ConnectionState ptr
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1)
+    {
+        perror("epoll_create1");
+        exit(1);
+    }
+    epoll_event ev;
+
+    size_t max_events = 100'000;
+    epoll_event events[max_events];
+
+    ev.events = EPOLLIN;
+    ev.data.fd = listener;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener, &ev) == -1)
+    {
+        perror("epoll_ctl: listen_sock");
+        exit(EXIT_FAILURE);
+    }
+#endif
+
     std::cout << "impl: " << impl << std::endl;
+
+    uint64_t poll_args_filling_dur_mcs{};
+    uint64_t poll_call_dur_mcs{};
+    uint64_t poll_res_process_dur_mcs{};
+    uint64_t max_poll_res_process_dur_mcs{};
 
     while (1)
     {
-        std::cout << "connections_counter: " << connections_counter << std::endl;
-
         int milliseconds_timeout = 1000;
 
 #ifdef SELECT_IMPL
@@ -296,11 +356,11 @@ int main()
         pollfd pfd = {listener, POLLIN, 0};
         poll_args.push_back(pfd);
 
+        auto start = std::chrono::system_clock::now();
+
         for (auto connection = fdsToConnections.begin(); connection != fdsToConnections.end(); connection++)
         {
             pollfd pfd = {connection->second.get()->fd, POLLERR, 0};
-
-            poll_args.push_back(pfd);
 
             if (connection->second.get()->want_read)
             {
@@ -314,11 +374,28 @@ int main()
             poll_args.push_back(pfd);
         }
 
+        auto end = std::chrono::system_clock::now();
+
+        // auto temp_poll_args_filling_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        poll_args_filling_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        // std::cout << "BEFORE connections_counter: " << connections_counter << std::endl;
+        //  std::cout << "poll_args.size(): " << poll_args.size() << std::endl;
+
+        start = std::chrono::system_clock::now();
         int pollRes = poll(poll_args.data(), (nfds_t)poll_args.size(), milliseconds_timeout);
+        end = std::chrono::system_clock::now();
+        // auto temp_poll_call_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        poll_call_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
         if (pollRes < 0 && errno == EINTR || pollRes == 0)
         {
             continue; // not an error
         }
+
+        // poll_args_filling_dur_mcs += temp_poll_args_filling_dur_mcs;
+        // poll_call_dur_mcs += temp_poll_call_dur_mcs;
+
         if (pollRes < 0)
         {
             return -1;
@@ -329,12 +406,23 @@ int main()
             handle_accept_poll(listener, fdsToConnections);
         }
 
+        start = std::chrono::system_clock::now();
         for (size_t i = 1; i < poll_args.size(); ++i)
         {
+
             uint32_t ready = poll_args[i].revents;
 
             auto &connection = *fdsToConnections[poll_args[i].fd];
 
+            if (ready & POLLERR)
+            {
+                close(connection.fd);
+                fdsToConnections.erase(poll_args[i].fd);
+
+                connections_counter.fetch_sub(1);
+                continue;
+            }
+            auto _start = std::chrono::system_clock::now();
             if (ready & POLLIN)
             {
                 handle_read(connection);
@@ -343,14 +431,139 @@ int main()
             {
                 handle_write(connection);
             }
-            if (ready & POLLERR || connection.want_close)
+            if (connection.want_close)
             {
                 close(connection.fd);
                 fdsToConnections.erase(poll_args[i].fd);
 
                 connections_counter.fetch_sub(1);
+            }
+            auto _end = std::chrono::system_clock::now();
+
+            auto temp = std::chrono::duration_cast<std::chrono::microseconds>(_end - _start).count();
+            if (temp > max_poll_res_process_dur_mcs)
+            {
+                max_poll_res_process_dur_mcs = temp;
+            }
+        }
+        end = std::chrono::system_clock::now();
+        // poll_res_process_dur_mcs += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        poll_res_process_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        // std::cout << "AFTER connections_counter: " << connections_counter << std::endl;
+
+        if (read_flag)
+        {
+            read_flag = false;
+            std::cout << "poll_args_filling_dur_mcs: " << poll_args_filling_dur_mcs << std::endl;
+            std::cout << "poll_call_dur_mcs: " << poll_call_dur_mcs << std::endl;
+            std::cout << "poll_res_process_dur_mcs: " << poll_res_process_dur_mcs << std::endl;
+            std::cout << "max_poll_res_process_dur_mcs: " << max_poll_res_process_dur_mcs << std::endl;
+        }
+#endif
+
+#ifdef EPOLL_IMPL
+        auto start = std::chrono::system_clock::now();
+        int epoll_res = epoll_wait(epoll_fd, events, max_events, milliseconds_timeout);
+        auto end = std::chrono::system_clock::now();
+        // auto temp_poll_call_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        poll_call_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        // poll_args_filling_dur_mcs += temp_poll_args_filling_dur_mcs;
+        // poll_call_dur_mcs += temp_poll_call_dur_mcs;
+
+        if (epoll_res == -1)
+        {
+            perror("epoll_wait");
+            exit(EXIT_FAILURE);
+        }
+
+        start = std::chrono::system_clock::now();
+        for (int i = 0; i < epoll_res; ++i)
+        {
+            if (events[i].events & EPOLLERR)
+            {
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL) == -1)
+                    perror("epoll_ctl: EPOLL_CTL_DEL");
+
+                close(events[i].data.fd);
+
+                if (events[i].data.fd == listener)
+                    return -1;
+
+                fdsToConnections.erase(events[i].data.fd);
+
+                connections_counter.fetch_sub(1);
                 continue;
             }
+            if (events[i].data.fd == listener)
+            {
+                handle_accept_epoll(listener, fdsToConnections, epoll_fd);
+                continue;
+            }
+
+            auto &connection = *fdsToConnections[events[i].data.fd];
+            auto _start = std::chrono::system_clock::now();
+
+            if (events[i].events & EPOLLIN)
+            {
+                handle_read(connection);
+            }
+            if (events[i].events & EPOLLOUT)
+            {
+                handle_write(connection);
+            }
+            if (connection.want_close)
+            {
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL) == -1)
+                    perror("epoll_ctl: EPOLL_CTL_DEL");
+
+                close(events[i].data.fd);
+
+                if (events[i].data.fd == listener)
+                    return -1;
+
+                fdsToConnections.erase(events[i].data.fd);
+
+                connections_counter.fetch_sub(1);
+                continue;
+            }
+            auto _end = std::chrono::system_clock::now();
+
+            auto temp = std::chrono::duration_cast<std::chrono::microseconds>(_end - _start).count();
+            if (temp > max_poll_res_process_dur_mcs)
+            {
+                max_poll_res_process_dur_mcs = temp;
+            }
+
+            // update flags
+            if (events[i].data.fd != listener)
+            {
+                if (connection.want_read)
+                {
+                    events[i].events = EPOLLIN | EPOLLRDHUP;
+                }
+                if (connection.want_write)
+                {
+                    events[i].events = EPOLLOUT | EPOLLRDHUP;
+                }
+
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, events[i].data.fd, &events[i]);
+            }
+        }
+        end = std::chrono::system_clock::now();
+        // poll_res_process_dur_mcs += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        poll_res_process_dur_mcs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+        // std::cout << "AFTER connections_counter: " << connections_counter << std::endl;
+
+        if (read_flag)
+        {
+            read_flag = false;
+            std::cout << "poll_args_filling_dur_mcs: " << poll_args_filling_dur_mcs << std::endl;
+            std::cout << "poll_call_dur_mcs: " << poll_call_dur_mcs << std::endl;
+            std::cout << "poll_res_process_dur_mcs: " << poll_res_process_dur_mcs << std::endl;
+            std::cout << "max_poll_res_process_dur_mcs: " << max_poll_res_process_dur_mcs << std::endl;
         }
 #endif
     }
