@@ -1,3 +1,5 @@
+#include "server.h"
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -10,6 +12,7 @@
 #include <unordered_map>
 #include <memory>
 
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <cstring>
@@ -22,43 +25,62 @@
 // #define POLL_IMPL
 #define EPOLL_IMPL
 
-typedef size_t lengthSizeType;
-const size_t bytesForLengthSizeTypes = sizeof(lengthSizeType);
-const size_t oneReadSize = 512;
-const size_t oneWriteSize = 512;
-std::atomic<int> connections_counter{0};
-bool read_flag = false;
-
-struct Request
+void threadSafePrint(const std::string &str)
 {
-    lengthSizeType len;
-    std::vector<uint8_t> data;
-};
+    static std::mutex m{};
+    m.lock();
+    std::cout << str << std::endl;
+    m.unlock();
+}
 
-struct Responce
+void defaultTransformer(const std::vector<uint8_t> &dataIn, std::vector<uint8_t> &dataOut)
 {
-    lengthSizeType len;
-    std::vector<uint8_t> data;
-};
+    dataOut = dataIn;
+}
 
-struct ConnectionState
+NetCommServer::NetCommServer(int port, int numOfThreads, int oneSocketReadSize, int oneSocketWriteSize)
+    : m_port{port}, m_num_of_threads{numOfThreads}, m_one_socket_read_size{oneSocketReadSize}, m_one_socket_write_size{oneSocketWriteSize}, m_transformer{defaultTransformer}
 {
-    int fd = -1;
-    bool want_read = false;
-    bool want_write = false;
-    bool want_close = false;
-    // bool can_read;
-    // bool can_write;
+}
 
-    std::vector<uint8_t> incoming_buffer;
-    std::vector<uint8_t> outgoing_buffer;
+NetCommServer::~NetCommServer()
+{
+    stop();
+}
 
-    ConnectionState(int fd_);
-};
+void NetCommServer::set_transform_function(transformFunctionType transformer)
+{
+    // not threadsafe because single call before run is implied
+    m_transformer = std::move(transformer);
+}
 
-ConnectionState::ConnectionState(int fd_) : fd{fd_} {}
+void NetCommServer::run()
+{
+    m_stopped_flag.store(false);
 
-void handle_accept_select(int listeningFd, std::list<std::unique_ptr<ConnectionState>> &connections)
+    std::lock_guard lk{m_run_stop_waiter};
+    std::vector<std::thread> threads{};
+
+    for (size_t i = 0; i < m_num_of_threads - 1; i++)
+    {
+        threads.emplace_back(&NetCommServer::serverEventLoop, this, i);
+    }
+
+    serverEventLoop(m_num_of_threads - 1);
+
+    for (auto &t : threads)
+    {
+        t.join();
+    }
+}
+
+void NetCommServer::stop()
+{
+    m_stopped_flag.store(true);
+    std::lock_guard lk{m_run_stop_waiter};
+}
+
+void NetCommServer::handle_accept_select(int listeningFd, std::list<std::unique_ptr<ConnectionState>> &connections)
 {
     int newSock = accept(listeningFd, NULL, NULL);
     if (newSock < 0)
@@ -73,10 +95,10 @@ void handle_accept_select(int listeningFd, std::list<std::unique_ptr<ConnectionS
     connections.push_back(std::make_unique<ConnectionState>(newSock));
     connections.back()->want_read = true;
 
-    connections_counter.fetch_add(1);
+    m_connections_counter.fetch_add(1);
 }
 
-void handle_accept_poll(int listeningFd, std::unordered_map<int, std::unique_ptr<ConnectionState>> &fdsToConnections)
+void NetCommServer::handle_accept_poll(int listeningFd, std::unordered_map<int, std::unique_ptr<ConnectionState>> &fdsToConnections)
 {
     int newSock = accept(listeningFd, NULL, NULL);
     if (newSock < 0)
@@ -91,12 +113,26 @@ void handle_accept_poll(int listeningFd, std::unordered_map<int, std::unique_ptr
     fdsToConnections[newSock] = std::make_unique<ConnectionState>(newSock);
     fdsToConnections[newSock]->want_read = true;
 
-    connections_counter.fetch_add(1);
+    m_connections_counter.fetch_add(1);
 }
 
-void handle_accept_epoll(int listeningFd, std::unordered_map<int, std::unique_ptr<ConnectionState>> &fdsToConnections, int epollFd)
+void NetCommServer::handle_accept_epoll(int listeningFd, std::unordered_map<int, std::unique_ptr<ConnectionState>> &fdsToConnections, int epollFd, int threadId)
 {
-    int newSock = accept(listeningFd, NULL, NULL);
+    sockaddr_in clientAddr = {};
+    socklen_t socklen = sizeof(clientAddr);
+
+    int newSock = accept(listeningFd, (sockaddr *)&clientAddr, &socklen);
+
+    std::string str{"thread: "};
+    str += std::to_string(threadId);
+    str += ", sockFd: ";
+    str += std::to_string(newSock);
+    str += ", Port: ";
+    str += std::to_string(clientAddr.sin_port);
+
+    // threadSafePrint(str);
+    //  std::cout << "thread: " << threadId << ", sockFd: " << newSock << ", Port: " << clientAddr.sin_port << std::endl;
+
     if (newSock < 0)
     {
         return;
@@ -119,15 +155,10 @@ void handle_accept_epoll(int listeningFd, std::unordered_map<int, std::unique_pt
     fdsToConnections[newSock] = std::make_unique<ConnectionState>(newSock);
     fdsToConnections[newSock]->want_read = true;
 
-    connections_counter.fetch_add(1);
+    m_connections_counter.fetch_add(1);
 }
 
-void transform(const std::vector<uint8_t> &dataIn, std::vector<uint8_t> &dataOut)
-{
-    dataOut = dataIn;
-}
-
-bool try_process_request(ConnectionState &connection)
+bool NetCommServer::try_process_request(ConnectionState &connection)
 {
     if (connection.incoming_buffer.size() < bytesForLengthSizeTypes)
     {
@@ -150,7 +181,7 @@ bool try_process_request(ConnectionState &connection)
 
     res.len = req.len;
 
-    transform(req.data, res.data);
+    m_transformer(req.data, res.data);
 
     connection.outgoing_buffer.assign(res.len + bytesForLengthSizeTypes, 0);
 
@@ -162,10 +193,10 @@ bool try_process_request(ConnectionState &connection)
     return true;
 }
 
-void handle_read(ConnectionState &connection)
+void NetCommServer::handle_read(ConnectionState &connection)
 {
-    char buf[oneReadSize];
-    int bytes_read = recv(connection.fd, buf, oneReadSize, MSG_NOSIGNAL);
+    char buf[m_one_socket_read_size];
+    int bytes_read = recv(connection.fd, buf, m_one_socket_read_size, MSG_NOSIGNAL);
 
     if (bytes_read <= 0)
     {
@@ -173,8 +204,8 @@ void handle_read(ConnectionState &connection)
         return;
     }
 
-    read_flag = true;
-    std::cout << "handle_read got " << bytes_read << " bytes" << std::endl;
+    m_read_flag = true;
+    // std::cout << "handle_read got " << bytes_read << " bytes" << std::endl;
 
     connection.incoming_buffer.insert(connection.incoming_buffer.end(), buf, buf + bytes_read);
 
@@ -187,10 +218,10 @@ void handle_read(ConnectionState &connection)
     }
 }
 
-void handle_write(ConnectionState &connection)
+void NetCommServer::handle_write(ConnectionState &connection)
 {
-    int bytes_write = send(connection.fd, &(connection.outgoing_buffer[0]), std::min(oneWriteSize, connection.outgoing_buffer.size()), MSG_NOSIGNAL);
-    std::cout << "bytes_write: " << bytes_write << std::endl;
+    int bytes_write = send(connection.fd, &(connection.outgoing_buffer[0]), std::min(m_one_socket_write_size, connection.outgoing_buffer.size()), MSG_NOSIGNAL);
+    // std::cout << "bytes_write: " << bytes_write << std::endl;
     if (bytes_write <= 0)
     {
         connection.want_close = true;
@@ -206,7 +237,7 @@ void handle_write(ConnectionState &connection)
     }
 }
 
-int main()
+int NetCommServer::serverEventLoop(int threadId)
 {
     int listener;
     struct sockaddr_in addr;
@@ -218,10 +249,16 @@ int main()
         exit(1);
     }
 
+    std::cout << "listener thread [" << threadId << "], fd: " << listener << std::endl;
+
     fcntl(listener, F_SETFL, O_NONBLOCK);
 
+    int optVal = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEPORT, &optVal, sizeof(optVal)); // for access to socket from different threads
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &optVal, sizeof(optVal)); // for fast restart
+
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(3425);
+    addr.sin_port = htons(m_port);
     addr.sin_addr.s_addr = INADDR_ANY;
     if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
@@ -275,7 +312,7 @@ int main()
     uint64_t poll_res_process_dur_mcs{};
     uint64_t max_poll_res_process_dur_mcs{};
 
-    while (1)
+    while (m_stopped_flag.load() == false)
     {
         int milliseconds_timeout = 1000;
 
@@ -493,12 +530,12 @@ int main()
 
                 fdsToConnections.erase(events[i].data.fd);
 
-                connections_counter.fetch_sub(1);
+                m_connections_counter.fetch_sub(1);
                 continue;
             }
             if (events[i].data.fd == listener)
             {
-                handle_accept_epoll(listener, fdsToConnections, epoll_fd);
+                handle_accept_epoll(listener, fdsToConnections, epoll_fd, threadId);
                 continue;
             }
 
@@ -525,7 +562,7 @@ int main()
 
                 fdsToConnections.erase(events[i].data.fd);
 
-                connections_counter.fetch_sub(1);
+                m_connections_counter.fetch_sub(1);
                 continue;
             }
             auto _end = std::chrono::system_clock::now();
@@ -557,13 +594,13 @@ int main()
 
         // std::cout << "AFTER connections_counter: " << connections_counter << std::endl;
 
-        if (read_flag)
+        if (m_read_flag)
         {
-            read_flag = false;
-            std::cout << "poll_args_filling_dur_mcs: " << poll_args_filling_dur_mcs << std::endl;
-            std::cout << "poll_call_dur_mcs: " << poll_call_dur_mcs << std::endl;
-            std::cout << "poll_res_process_dur_mcs: " << poll_res_process_dur_mcs << std::endl;
-            std::cout << "max_poll_res_process_dur_mcs: " << max_poll_res_process_dur_mcs << std::endl;
+            // read_flag = false;
+            // std::cout << "poll_args_filling_dur_mcs: " << poll_args_filling_dur_mcs << std::endl;
+            // std::cout << "poll_call_dur_mcs: " << poll_call_dur_mcs << std::endl;
+            // std::cout << "poll_res_process_dur_mcs: " << poll_res_process_dur_mcs << std::endl;
+            // std::cout << "max_poll_res_process_dur_mcs: " << max_poll_res_process_dur_mcs << std::endl;
         }
 #endif
     }

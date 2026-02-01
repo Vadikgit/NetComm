@@ -1,7 +1,4 @@
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
+#include "client.h"
 #include <cstdlib>
 #include <unistd.h>
 #include <cstdio>
@@ -9,151 +6,207 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <chrono>
 #include <thread>
 
-#include <arpa/inet.h>
-#include <cstring>
-
-const size_t oneReadSize = 1024;
-const size_t oneWriteSize = 1024;
-
-void sendBytes(int sockfd, std::string &data)
+void work(int myId, std::string ipAddr, int port,
+          int numOfConnectionsPerThread,
+          int numOfRequestsPerConnection,
+          int numOfBytesForOneRequest,
+          int delayBetveenRequestsInMcs,
+          bool sendThreadConnectionsRequestsSimultaneously)
 {
-    data.insert(data.begin(), sizeof(size_t), 0);
-    *(reinterpret_cast<size_t *>(&(data[0]))) = data.size() - sizeof(size_t);
 
-    size_t already_sent = 0;
-
-    while (already_sent != data.length())
+    if (sendThreadConnectionsRequestsSimultaneously == false)
     {
-        int sent = send(sockfd, &(data[0 + already_sent]), std::min(oneWriteSize, data.length() - already_sent), 0);
-
-        if (sent <= 0)
+        for (size_t i = 0; i < numOfConnectionsPerThread; i++)
         {
-            return;
+            NetCommClient client{ipAddr, port};
+
+            std::string msg{};
+            msg.assign(numOfBytesForOneRequest, 0);
+
+            for (int j = 0; j < numOfBytesForOneRequest; j++)
+            {
+                msg[j] = '0' + (j % 10);
+            }
+
+            for (size_t j = 0; j < numOfRequestsPerConnection; j++)
+            {
+                std::string respStr{};
+
+                auto start = std::chrono::system_clock::now();
+
+                client.send_bytes(msg);
+
+                auto end = std::chrono::system_clock::now();
+
+                // std::cout << "CLIENT [" << myId << "] request (" << i << "), Sending completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
+
+                start = std::chrono::system_clock::now();
+
+                client.get_bytes(respStr);
+
+                end = std::chrono::system_clock::now();
+
+                if (respStr.size() != msg.size())
+                {
+                    std::cerr << "req data size != resp data size (" << msg.size() << " != " << respStr.size() << ")" << std::endl;
+                }
+
+                // std::cout << "CLIENT [" << myId << "] request (" << i << "), Receiving completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
+
+                std::this_thread::sleep_for(std::chrono::microseconds(delayBetveenRequestsInMcs));
+            }
+        }
+    }
+    else
+    {
+        std::vector<std::unique_ptr<NetCommClient>> clients;
+        for (size_t i = 0; i < numOfConnectionsPerThread; i++)
+        {
+            clients.emplace_back(std::make_unique<NetCommClient>(ipAddr, port));
         }
 
-        already_sent += sent;
-    }
-
-    data.erase(data.begin(), data.begin() + sizeof(size_t));
-}
-
-void getBytes(int sockfd, std::string &data)
-{
-    char buf[oneReadSize];
-
-    int recieved = 0;
-    size_t received_total = 0;
-
-    while (received_total < sizeof(size_t))
-    {
-        recieved = recv(sockfd, buf + received_total, oneReadSize - received_total, 0);
-
-        if (recieved <= 0)
+        for (size_t i = 0; i < numOfRequestsPerConnection; i++)
         {
-            return;
+            std::string msg{};
+            msg.assign(numOfBytesForOneRequest, 0);
+
+            for (int j = 0; j < numOfBytesForOneRequest; j++)
+            {
+                msg[j] = '0' + (j % 10);
+            }
+
+            for (size_t j = 0; j < numOfConnectionsPerThread; j++)
+            {
+                std::string respStr{};
+
+                auto start = std::chrono::system_clock::now();
+
+                clients[j]->send_bytes(msg);
+
+                auto end = std::chrono::system_clock::now();
+
+                // std::cout << "CLIENT [" << myId << "] request (" << i << "), Sending completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
+
+                start = std::chrono::system_clock::now();
+
+                clients[j]->get_bytes(respStr);
+
+                end = std::chrono::system_clock::now();
+
+                if (respStr.size() != msg.size())
+                {
+                    std::cerr << "req data size != resp data size (" << msg.size() << " != " << respStr.size() << ")" << std::endl;
+                }
+
+                // std::cout << "CLIENT [" << myId << "] request (" << i << "), Receiving completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
+
+                std::this_thread::sleep_for(std::chrono::microseconds(delayBetveenRequestsInMcs));
+            }
         }
-
-        received_total += recieved;
-    }
-
-    size_t numberOfBytesToGet = 0;
-    numberOfBytesToGet = *(reinterpret_cast<size_t *>(buf));
-
-    data.assign(numberOfBytesToGet, 0);
-
-    memcpy(&(data[0]), buf + sizeof(numberOfBytesToGet), received_total - sizeof(numberOfBytesToGet));
-
-    while (received_total < sizeof(numberOfBytesToGet) + numberOfBytesToGet)
-    {
-        recieved = recv(sockfd, buf, oneReadSize, 0);
-
-        if (recieved <= 0)
-        {
-            return;
-        }
-
-        memcpy(&(data[received_total - sizeof(numberOfBytesToGet)]), buf, recieved);
-
-        received_total += recieved;
     }
 }
 
-void work(int myId, int numOfRequestsPerThread, int numOfBytesForOneRequest, int delayBetveenRequestsInMcs)
+std::string_view ipAddrParamString = "address";
+std::string_view portParamString = "port";
+std::string_view numOfThreadsParamString = "threads";
+std::string_view connectionsPerThreadParamString = "connections";
+std::string_view requestsPerConnectionParamString = "requests";
+std::string_view sendThreadConnectionsRequestsSimultaneouslyParamString = "parallel";
+std::string_view numOfBytesForOneRequestParamString = "bytes";
+std::string_view delayBetveenRequestsInMcsParamString = "delay";
+
+constexpr std::string_view defaultServerIpAddr = "127.0.0.1";
+constexpr int defaultServerPort = defaultPort;
+constexpr int defaultNumOfThreads = 1;
+constexpr int defaultNumOfConnectionsPerThread = 1;
+constexpr int defaultNumOfRequestsPerConnection = 10;
+constexpr bool defaultSendThreadConnectionsRequestsSimultaneously = false;
+constexpr int defaultNumOfBytesForOneRequest = 1024;
+constexpr int defaultDelayBetveenRequestsInMcs = 0;
+
+void processCmdLineArgs(int argc, char **argv,
+                        std::string &ipAddr,
+                        int &port,
+                        int &threads_num,
+                        int &connections_per_thread,
+                        int &requests_per_connection,
+                        bool &parallel_send,
+                        int &bytes_for_one_request,
+                        int &delay_betveen_requests)
 {
-    int sock;
-    struct sockaddr_in addr;
+    ipAddr = defaultServerIpAddr;
+    port = defaultServerPort;
+    threads_num = defaultNumOfThreads;
+    connections_per_thread = defaultNumOfConnectionsPerThread;
+    requests_per_connection = defaultNumOfRequestsPerConnection;
+    parallel_send = defaultSendThreadConnectionsRequestsSimultaneously;
+    bytes_for_one_request = defaultNumOfBytesForOneRequest;
+    delay_betveen_requests = defaultDelayBetveenRequestsInMcs;
 
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
+    for (size_t i = 1; i < argc;)
     {
-        perror("socket");
-        exit(1);
+        if (std::string_view(argv[i]) == ipAddrParamString)
+            ipAddr = std::string(argv[i]);
+        else if (std::string_view(argv[i]) == portParamString)
+            port = atoi(argv[++i]);
+        else if (std::string_view(argv[i]) == numOfThreadsParamString)
+            threads_num = atoi(argv[++i]);
+        else if (std::string_view(argv[i]) == connectionsPerThreadParamString)
+            connections_per_thread = atoi(argv[++i]);
+        else if (std::string_view(argv[i]) == requestsPerConnectionParamString)
+            requests_per_connection = atoi(argv[++i]);
+        else if (std::string_view(argv[i]) == sendThreadConnectionsRequestsSimultaneouslyParamString)
+            parallel_send = true;
+        else if (std::string_view(argv[i]) == numOfBytesForOneRequestParamString)
+            bytes_for_one_request = atoi(argv[++i]);
+        else if (std::string_view(argv[i]) == delayBetveenRequestsInMcsParamString)
+            delay_betveen_requests = atoi(argv[++i]);
+
+        ++i;
     }
-
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(3425);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        perror("connect");
-        exit(2);
-    }
-
-    std::string msg{};
-    msg.assign(numOfBytesForOneRequest, 0);
-
-    for (int i = 0; i < numOfBytesForOneRequest; i++)
-    {
-        msg[i] = '0' + (i % 10);
-    }
-
-    std::string respStr;
-
-    for (size_t i = 0; i < numOfRequestsPerThread; i++)
-    {
-        auto start = std::chrono::system_clock::now();
-
-        sendBytes(sock, msg);
-
-        auto end = std::chrono::system_clock::now();
-
-        // std::cout << "CLIENT [" << myId << "] request (" << i << "), Sending completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
-
-        start = std::chrono::system_clock::now();
-
-        getBytes(sock, respStr);
-
-        end = std::chrono::system_clock::now();
-
-        // std::cout << "CLIENT [" << myId << "] request (" << i << "), Receiving completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
-
-        std::this_thread::sleep_for(std::chrono::microseconds(delayBetveenRequestsInMcs));
-    }
-    close(sock);
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    int numOfThreads = 4;
-    int numOfRequestsPerThread = 10;
-    int numOfBytesForOneRequest = 1024;
-    int delayBetveenRequestsInMcs = 0;
+    std::string ipAddr;
+    int port;
+    int numOfThreads;
+    int numOfConnectionsPerThread;
+    int numOfRequestsPerConnection;
+    bool sendThreadConnectionsRequestsSimultaneously;
+    int numOfBytesForOneRequest;
+    int delayBetveenRequestsInMcs;
 
-    std::cout << std::endl
-              << std::endl
-              << std::thread::hardware_concurrency() << std::endl;
+    processCmdLineArgs(argc, argv,
+                       ipAddr, port, numOfThreads,
+                       numOfConnectionsPerThread,
+                       numOfRequestsPerConnection,
+                       sendThreadConnectionsRequestsSimultaneously,
+                       numOfBytesForOneRequest,
+                       delayBetveenRequestsInMcs);
 
     std::vector<std::thread> clients;
 
     auto start = std::chrono::system_clock::now();
 
-    for (size_t i = 0; i < numOfThreads; i++)
+    for (size_t i = 0; i < numOfThreads - 1; i++)
     {
-        clients.emplace_back(work, i, numOfRequestsPerThread, numOfBytesForOneRequest, delayBetveenRequestsInMcs);
+        clients.emplace_back(work, i, ipAddr, port,
+                             numOfConnectionsPerThread,
+                             numOfRequestsPerConnection,
+                             numOfBytesForOneRequest,
+                             delayBetveenRequestsInMcs,
+                             sendThreadConnectionsRequestsSimultaneously);
     }
+
+    work(numOfThreads - 1, ipAddr, port,
+         numOfConnectionsPerThread,
+         numOfRequestsPerConnection,
+         numOfBytesForOneRequest,
+         delayBetveenRequestsInMcs,
+         sendThreadConnectionsRequestsSimultaneously);
 
     for (auto &i : clients)
         i.join();
