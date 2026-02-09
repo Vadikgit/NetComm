@@ -44,20 +44,30 @@ NetCommClient::~NetCommClient()
     close(m_sock_fd);
 }
 
-void NetCommClient::send_bytes(std::string &data)
+void NetCommClient::send_bytes(const std::string &data)
 {
-    data.insert(data.begin(), sizeof(size_t), 0);
-    *(reinterpret_cast<size_t *>(&(data[0]))) = data.size() - sizeof(size_t);
-
-    // std::cout << "I want to send " << data.length() << " bytes" << std::endl;
-
     size_t already_sent = 0;
+    lengthSizeType dataSize = data.size();
+    int sent = 0;
 
     auto start = std::chrono::system_clock::now();
 
-    while (already_sent != data.length())
+    while (already_sent != sizeof(dataSize))
     {
-        int sent = send(m_sock_fd, &(data[0 + already_sent]), std::min(m_one_socket_write_size, data.length() - already_sent), 0);
+        sent = send(m_sock_fd, &dataSize, std::min(m_one_socket_write_size, sizeof(dataSize) - already_sent), MSG_MORE); // prevent send without data
+
+        if (sent <= 0)
+        {
+            return;
+        }
+        already_sent += sent;
+    }
+
+    // std::cout << "I want to send " << data.length() << " bytes" << std::endl;
+
+    while (already_sent != data.length() + sizeof(dataSize))
+    {
+        sent = send(m_sock_fd, &(data[0 + already_sent - sizeof(dataSize)]), std::min(m_one_socket_write_size, data.length() + sizeof(dataSize) - already_sent), 0);
 
         if (sent <= 0)
         {
@@ -68,8 +78,6 @@ void NetCommClient::send_bytes(std::string &data)
     }
 
     auto end = std::chrono::system_clock::now();
-
-    data.erase(data.begin(), data.begin() + sizeof(size_t));
 
     // std::cout << "Completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
 }
@@ -83,7 +91,7 @@ void NetCommClient::get_bytes(std::string &data)
     int recieved = 0;
     size_t received_total = 0;
 
-    while (received_total < sizeof(size_t))
+    while (received_total < sizeof(lengthSizeType))
     {
         recieved = recv(m_sock_fd, buf + received_total, m_one_socket_read_size - received_total, 0);
 
@@ -96,7 +104,7 @@ void NetCommClient::get_bytes(std::string &data)
     }
 
     size_t numberOfBytesToGet = 0;
-    numberOfBytesToGet = *(reinterpret_cast<size_t *>(buf));
+    numberOfBytesToGet = *(reinterpret_cast<lengthSizeType *>(buf));
 
     data.assign(numberOfBytesToGet, 0);
 

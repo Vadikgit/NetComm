@@ -21,10 +21,10 @@ $(OBJECTS)/client_main.o: client_main.cpp | $(OBJECTS)
 	@$(CXX) $(CXXFLAGS) -g -c client_main.cpp -o $@
 
 $(BUILD)/server_app: $(OBJECTS)/server_main.o $(BUILD)/libnetcomm.so | $(OBJECTS)
-	@$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) -g -lelf -lz -o $@ -L$(BUILD) -lnetcomm -Wl,-rpath,.
+	@$(CXX) $(CXXFLAGS) $(OBJECTS)/server_main.o $(ALL_LDFLAGS) -g -lelf -lz -L$(BUILD) -lnetcomm -Wl,-rpath,. -o $@ 
 	
 $(BUILD)/client_app: $(OBJECTS)/client_main.o $(BUILD)/libnetcomm.so | $(OBJECTS)
-	@$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) -g -lelf -lz -o $@ -L$(BUILD) -lnetcomm -Wl,-rpath,.
+	@$(CXX) $(CXXFLAGS) $(OBJECTS)/client_main.o $(ALL_LDFLAGS) -g -lelf -lz -L$(BUILD) -lnetcomm -Wl,-rpath,. -o $@ 
 
 complete: $(BUILD)/client_app $(BUILD)/server_app
 	@rm -rf $(OBJECTS)

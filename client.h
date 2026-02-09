@@ -28,7 +28,7 @@ public:
                   int oneSocketWriteSize = defaultOneSocketWriteSize);
     ~NetCommClient();
 
-    void send_bytes(std::string &data);
+    void send_bytes(const std::string &data);
     void get_bytes(std::string &data);
 
 private:
