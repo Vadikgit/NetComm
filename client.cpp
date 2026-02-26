@@ -44,17 +44,16 @@ NetCommClient::~NetCommClient()
     close(m_sock_fd);
 }
 
-void NetCommClient::send_bytes(const std::string &data)
+void NetCommClient::send_bytes_impl(const uint8_t *data, lengthSizeType len)
 {
     size_t already_sent = 0;
-    lengthSizeType dataSize = data.size();
     int sent = 0;
 
     auto start = std::chrono::system_clock::now();
 
-    while (already_sent != sizeof(dataSize))
+    while (already_sent != sizeof(len))
     {
-        sent = send(m_sock_fd, &dataSize, std::min(m_one_socket_write_size, sizeof(dataSize) - already_sent), MSG_MORE); // prevent send without data
+        sent = send(m_sock_fd, &len, std::min(m_one_socket_write_size, sizeof(len) - already_sent), MSG_MORE); // prevent send without data
 
         if (sent <= 0)
         {
@@ -65,9 +64,9 @@ void NetCommClient::send_bytes(const std::string &data)
 
     // std::cout << "I want to send " << data.length() << " bytes" << std::endl;
 
-    while (already_sent != data.length() + sizeof(dataSize))
+    while (already_sent != len + sizeof(len))
     {
-        sent = send(m_sock_fd, &(data[0 + already_sent - sizeof(dataSize)]), std::min(m_one_socket_write_size, data.length() + sizeof(dataSize) - already_sent), 0);
+        sent = send(m_sock_fd, &(data[0 + already_sent - sizeof(len)]), std::min(m_one_socket_write_size, len + sizeof(len) - already_sent), 0);
 
         if (sent <= 0)
         {
@@ -82,7 +81,18 @@ void NetCommClient::send_bytes(const std::string &data)
     // std::cout << "Completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
 }
 
-void NetCommClient::get_bytes(std::string &data)
+void NetCommClient::send_bytes(const std::string &data)
+{
+    send_bytes_impl(reinterpret_cast<const uint8_t *>(&(data[0])), data.length());
+}
+
+void NetCommClient::send_bytes(const std::vector<uint8_t> &data)
+{
+    send_bytes_impl(&(data[0]), data.size());
+}
+
+template <typename T>
+void NetCommClient::get_bytes_impl(T &data)
 {
     auto start = std::chrono::system_clock::now();
 
@@ -132,4 +142,14 @@ void NetCommClient::get_bytes(std::string &data)
     auto end = std::chrono::system_clock::now();
 
     // std::cout << "Completed for " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " mcs" << std::endl;
+}
+
+void NetCommClient::get_bytes(std::string &data)
+{
+    get_bytes_impl<std::string>(data);
+}
+
+void NetCommClient::get_bytes(std::vector<uint8_t> &data)
+{
+    get_bytes_impl<std::vector<uint8_t>>(data);
 }
