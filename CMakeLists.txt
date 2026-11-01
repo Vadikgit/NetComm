@@ -15,4 +15,4 @@ add_executable(client_app client_main.cpp)
 target_link_libraries(server_app netcomm)
 target_link_libraries(client_app netcomm)
 
-file(COPY ${CMAKE_SOURCE_DIR}/common.h ${CMAKE_SOURCE_DIR}/client.h ${CMAKE_SOURCE_DIR}/server.h DESTINATION ${PROJECT_BINARY_DIR}/include)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/common.h ${CMAKE_CURRENT_SOURCE_DIR}/client.h ${CMAKE_CURRENT_SOURCE_DIR}/server.h DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/include)
